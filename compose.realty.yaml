@@ -1,0 +1,374 @@
+# Проект `realty`: продукт (мост, граф напоминаний, MCP-листенер) и его базы. Свой композ, свой образ,
+# своё имя проекта compose.
+#
+# **❗ Имя проекта compose СОХРАНЕНО — это условие, а не небрежность.** Тома названы по имени проекта:
+# корпус RAG и чекпойнты напоминаний лежат в томах с префиксом проекта. Смена имени создала бы НОВЫЕ
+# ПУСТЫЕ тома, а старые остались бы висеть — то есть молчаливая потеря корпуса и чекпойнтов.
+# Переименование проекта = миграция данных, а не переезд файла.
+#
+# Использование:
+#   1) общая сеть поднята — создаётся вне этого проекта
+#   2) `cp .env.example .env` и заполнить значения
+#   3) `bash realty-up.sh up`
+#
+# Сеть — общая с платформой: проект её не создаёт, только подключается (`external: true`).
+# ❗ База продукта живёт НЕ здесь и НЕ в стеке вендора: её пишут два контура (мост и новости), поэтому она
+# в отдельном стеке данных. Сервис `pgvector` нужен потому, что в postgres платформы расширения `vector`
+# нет, а менять образ платформы нельзя: своя база — в своём контейнере, и владелец этой базы — `realty`.
+
+name: realty
+
+networks:
+  platform:
+    external: true
+    name: ${PLATFORM_NETWORK:?PLATFORM_NETWORK не задан — имя общей сети платформы}
+
+volumes:
+  #: База САМОГО продукта: свой экземпляр, своё имя тома. У каждого контура свой postgres, поэтому откат
+  #: или пересоздание стека соседа не задевает данные.
+  realty-db-data:
+    name: realty-db-data
+  # ❗ Имена ЗАДАНЫ ЯВНО (`name:`), и это не украшение: объявленный без имени том получает префикс
+  # ПРОЕКТА compose, поэтому смена имени проекта создала бы НОВЫЙ ПУСТОЙ том, а старый остался бы
+  # висеть — то есть молчаливая потеря корпуса RAG и чекпойнтов напоминаний (`infra/CONTRACT.md`,
+  # правило 7; решение 0029). С явными именами проект можно переименовывать безопасно.
+  pgvector-data:
+    name: corpus-data
+  checkpoints-data:
+    name: checkpoints-data
+
+services:
+  # БАЗА ПРОДУКТА: свой экземпляр `postgres:17`, только база `realty`.
+  #
+  # **Зачем отдельный экземпляр.** Общий сервер двух баз означал, что откат или пересоздание стека
+  # одного продукта задевает данные другого, а роль и пароль приходилось создавать отдельным шагом.
+  # Здесь образ сразу создаёт роль и базу продукта, а том назван по продукту.
+  #
+  # ❗ Пароль — ОБЯЗАТЕЛЬНАЯ подстановка (`:?`): при пустой переменной образ не стартует вовсе, и цикл
+  # рестарта был бы неотличим от «база медленно поднимается».
+  realty-db:
+    image: postgres:17
+    container_name: realty-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: realty
+      POSTGRES_DB: realty
+      POSTGRES_PASSWORD: ${REALTY_DB_PASSWORD:?REALTY_DB_PASSWORD не задан в .env продукта}
+    volumes:
+      - realty-db-data:/var/lib/postgresql/data
+    #: Сеть — та же общая, что у остальных служб композа: база обязана быть видна им по имени службы.
+    networks: [platform]
+    ports:
+      - "127.0.0.1:55435:5432"
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      #: ❗ `pg_isready` НЕГОДЕН: он отвечает 0 и при отсутствующей базе. Спрашиваем саму базу.
+      test: ["CMD-SHELL", "psql -U realty -d realty -tAc 'select 1' >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+  # НАКАТ СХЕМЫ (`0025`): одноразовая служба, а не дело моста.
+  #
+  # **Зачем.** До неё схему накатывал только продуктовый мост, а остальные ждали. После разъезда проектов это
+  # стало зависимостью ПОРЯДКА запуска: на пустой базе новости не поднимались, потому что их таблицы создавал
+  # чужой процесс. Теперь накат — свой шаг, и каждый проект накатывает СВОИ компоненты.
+  #
+  # **Что накатывает ЭТОТ проект:** таблицы продукта и векторную базу (`product,vectors`). Новостные таблицы
+  # накатывает проект новостей: база у контуров одна, но владелец схемы у каждого свой.
+  #
+  # ❗ `restart: "no"` — не забывчивость: `unless-stopped` перезапускал бы одноразовый контейнер и ПОСЛЕ
+  # успешного выхода, то есть накат шёл бы по кругу.
+  # ❗ `image:` указан ЯВНО: compose без `image` строит ОТДЕЛЬНЫЙ образ на каждую службу, и `migrate`
+  # оказался бы без кода (замер).
+  # ❗ База платформы (`postgres`) — в ЧУЖОМ стеке, `depends_on` на неё невозможен: migrate ждёт её САМ
+  # (`startup.wait_ready`) вместо отказа с первой попытки.
+  migrate:
+    image: realty-agent:latest
+    restart: "no"
+    env_file:
+      #: Общая основа воркспейса — ПЕРВОЙ и необязательной: в ней лежат ключи, которые нужны
+      #: службе, но принадлежат не только ей (доступ к платформе, Telegram, LLM, подпись кнопок).
+      #: Нет файла — контейнер поднимется на своём `.env`: это законный одиночный клон.
+      - path: ../.env
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      #: Адрес базы (логин и пароль — свои у каждой базы) приходит из `.env` продукта.
+      VECTOR_DB_URL: postgresql+asyncpg://username:${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD не задан}@pgvector:5432/vectors
+    networks: [platform]
+    depends_on:
+      realty-db:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+    command: ["python", "-m", "realty_agent.db.migrate", "--components", "core,runtime,realty,vectors", "--wait", "180"]
+
+  bridge:
+    #: ❗ Один образ на ПРОДУКТ: `bridge`, `mcp`, `reminders` и `migrate` собираются из одного Dockerfile,
+    #: поэтому имя задано явно. Без `image:` compose тегирует каждый образ именем службы — четыре образа
+    #: из одного содержимого, и `migrate` при этом может остаться на СТАРОМ: накат шёл бы кодом до
+    #: смены колеса. Признак готовности — совпадение `.Image`, а не «healthy».
+    image: realty-agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # ❗ Окно на штатное завершение. По умолчанию docker даёт 10 с и добивает SIGKILL, а ход диалога
+    # ждёт до 240 с. SIGKILL обрывает `atexit`-досылку спанов (дерево в приёмнике обрезается — ложные
+    # доказательства) и теряет запись о деньгах. 300 с дают процессу свернуться самому.
+    stop_grace_period: 300s
+    env_file:
+      #: Общая основа воркспейса — ПЕРВОЙ и необязательной: в ней лежат ключи, которые нужны
+      #: службе, но принадлежат не только ей (доступ к платформе, Telegram, LLM, подпись кнопок).
+      #: Нет файла — контейнер поднимется на своём `.env`: это законный одиночный клон.
+      - path: ../.env
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      #: ❗ Каталог файлов-сессий задаётся явно: он НЕ выводится из расположения кода (общий слой живёт
+      #: в site-packages), а неверный путь = бот молча не подключится.
+      SESSIONS_DIR: /srv/realty/.sessions
+      #: ❗ Файл агента для СВОЕГО рантайма (`AGENT_RUNTIME=own`): путь задаётся явно и НЕ выводится из
+      #: расположения кода. Файл приходит в образ (`Dockerfile` копирует `onboarding/`), потому что без
+      #: него свой рантайм не соберёт системный промпт. На платформенном рантайме путь не читается.
+      DIALOG_PROMPT_PATH: /srv/realty/onboarding/realtor-bot.md
+      #: То же для роли ОБЪЯВЛЕНИЙ: свой файл, своя шапка (gpt-4o, 0.4, 600 токенов). Один файл на
+      #: роль — иначе объявления считались бы по параметрам диалога.
+      LISTING_PROMPT_PATH: /srv/realty/onboarding/listing-writer.md
+      #: Внутри сети работают ИМЕНА СЛУЖБ и внутренние порты: сеть нашего compose объявлена как
+      #: ВНЕШНЯЯ и совпадает с сетью платформы, поэтому `pgvector` из контейнера разрешается.
+      #: Адрес базы (логин и пароль — свои у каждой базы) приходит из `.env` продукта.
+      #: Векторная база — служба этого же compose.
+      VECTOR_DB_URL: postgresql+asyncpg://username:${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD не задан}@pgvector:5432/vectors
+      #: Хостовые службы: инференс, решатель и платформа живут ХОСТОВЫМИ процессами, поэтому в
+      #: контейнере `127.0.0.1` — это сам контейнер. Адрес хоста называем явно: иначе молча ломается
+      #: либо эмбеддинг, либо продолжение потока напоминаний, либо трассировка.
+      PLATFORM_API_URL: http://host.docker.internal:8680/api
+      OTEL_ENDPOINT: http://host.docker.internal:8680/api/otlp/v1/traces
+      # ❗ Второй вендор: адрес ЯВНО на хост-шлюз. В корневом `.env` он ХОСТОВЫЙ (127.0.0.1),
+      # а внутри контейнера 127.0.0.1 — сам контейнер: без этой строки спаны уходили бы «в себя»
+      # МОЛЧА. Порт 4318 опубликован на 0.0.0.0 именно поэтому (loopback из контейнера недостижим).
+      TELEMETRY_OTLP_ENDPOINT: http://host.docker.internal:4318/v1/traces
+      #: Имя приложения: у второго вендора `service.name` — КЛЮЧ ГРУППИРОВКИ (первый вендор ресурс
+      #: игнорирует).
+      # Адреса сервисов моделей приходят из `.env` агента и НЕ зашиваются здесь: в бою службы могут
+      # стоять на разных хостах, и значение — свойство развёртывания, а не файла композа. Обязательная
+      # подстановка (`:?`) делает пропуск громким: без адреса контейнер не поднимется, а не пойдёт
+      # молча «в себя» через loopback.
+      LLAMA_EMBED_URL: ${LLAMA_EMBED_URL:?LLAMA_EMBED_URL не задан в .env агента}
+      SOLVER_URL: ${SOLVER_URL:?SOLVER_URL не задан в .env агента}
+      #: Адрес графа для КОНТЕЙНЕРНОГО моста — по имени службы внутри общей сети. Хостовый мост ходит на
+      #: `127.0.0.1:8089` (умолчание настройки), и это работает, потому что порт графа опубликован на
+      #: loopback. ❗ Имя ключа — `BRIDGE_GRAPH_HOST`: настройка называется `bridge_graph_host`, и
+      #: прежнее имя в композе (`BRIDGE_REMINDERS_HOST`) не читал никто — мост в контейнере ходил на
+      #: `127.0.0.1:8089`, то есть в самого себя.
+      BRIDGE_GRAPH_HOST: reminders
+      MALLOC_ARENA_MAX: "2"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [platform]
+    # Сессия Telegram — ЕДИНСТВЕННЫЙ ключ доступа, и её нельзя пересоздать входом: монтируем папку с
+    # хоста и идём под её владельцем (`alex` = 1000:1000). Иначе Telethon МОЛЧА не выставит режим 0600
+    #: (файл-сессия пишется и читается только владельцем) и вход не пройдёт — права на файле это
+    #: подтверждают (`-rw-------`).
+    user: "1000:1000"
+    volumes:
+      - ./.sessions:/srv/realty/.sessions
+    # Локальные сервисы локального инференса живут на ХОСТЕ (systemd user-юниты), а не в
+    # этом compose: эмбеддинги — 8082, решатель решений — 8083. Без этой строки контейнер
+    # до них не дотянется: он в общей сети, и хостовой адрес ему неизвестен.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: 64m
+    #: Лимит по ЗАМЕРУ: пик cgroup процесса моста — 116 МиБ (текущий RSS 117 МиБ), то есть запас ×4.
+    #: Снимать «на глаз» нельзя: у эмбеддингов пик в 3.9 раза выше покоя, и лимит 512m там убил бы
+    #: службу.
+    mem_limit: 512m
+    # наружу не публикуем: доступ через ssh-туннель / traefik+basic-auth (порт 8081 внутри контейнера)
+    ports:
+      - "127.0.0.1:8085:8081"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "5"}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8081/health', timeout=5).status_code==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+
+  # Чекпойнт-база ГРАФА НАПОМИНАНИЙ: отдельная от векторов RAG.
+  #
+  # **Почему отдельная, а не «рядом с корпусом».** Корпус переиндексируется (объём, чанки, реранкинг), а
+  # чекпойнты живут по ходам и держат потоки, ждущие человека, неделями. Разные жизненные циклы в одном
+  # хранилище означают, что переиндексация рискует состоянием живых потоков. Адрес чекпойнтов задаётся
+  # ЯВНО (`REMINDERS_CHECKPOINT_DSN`), а пустое значение — отказ с причиной: выводить его из
+  # `VECTOR_DB_URL` значило бы разделять базы только на бумаге.
+  reminders-db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: username
+      POSTGRES_PASSWORD: ${GRAPH_DB_PASSWORD:?GRAPH_DB_PASSWORD не задан}
+      POSTGRES_DB: reminders
+    volumes:
+      - checkpoints-data:/var/lib/postgresql/data
+    networks: [platform]
+    mem_limit: 256m
+    #: Порт только на localhost: хостовый процесс графа (юнит, `bridge-up-reminders.sh run`) ходит сюда,
+    #: а в docker-сети адрес — `reminders-db:5432`, публикация не нужна.
+    ports:
+      - "127.0.0.1:55434:5432"
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U username -d reminders"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  # MCP-ЛИСТЕНЕР: свой процесс, свой порт.
+  #
+  #: **Почему публикуем на 0.0.0.0, а не на 127.0.0.1.** Вызов приходит через docker-хост
+  #: (`host.docker.internal:8087`), а не с loopback: публикация только на `127.0.0.1` отрезала бы MCP-клиента
+  #: от инструментов. Настоящий гейт — ACL по ключу (`realty_agent/mcp/server.py`).
+  mcp:
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    #: Тот же образ продукта (см. комментарий у `bridge`): один Dockerfile — одно имя.
+    image: realty-agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # ❗ Окно на штатное завершение: без него docker добивает процесс SIGKILL, обрывая досылку спанов
+    # и запись о деньгах.
+    stop_grace_period: 300s
+    env_file:
+      #: Общая основа воркспейса — ПЕРВОЙ и необязательной: в ней лежат ключи, которые нужны
+      #: службе, но принадлежат не только ей (доступ к платформе, Telegram, LLM, подпись кнопок).
+      #: Нет файла — контейнер поднимется на своём `.env`: это законный одиночный клон.
+      - path: ../.env
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      #: Адрес базы (логин и пароль — свои у каждой базы) приходит из `.env` продукта; база живёт по
+      #: имени службы в общей сети — одном и том же для всех служб этого композа.
+      MCP_BIND_HOST: 0.0.0.0
+      MCP_PORT: "8087"
+    networks: [platform]
+    ports:
+      - "8087:8087"
+    mem_limit: 384m
+    command: ["uvicorn", "realty_agent.mcp_main:app", "--host", "0.0.0.0", "--port", "8087", "--no-access-log"]
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8087/health', timeout=5).status_code==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+
+  # ГРАФ НАПОМИНАНИЙ: тот же образ, другая точка входа — свой процесс в общей сети.
+  #
+  #: **Почему не `network_mode: host`.** В общей сети службы доступны по имени, а host-режим этому мешал:
+  #: из docker-сети напоминания по имени невидимы.
+  #
+  # **Что меняется и что нет:** адрес со стороны моста (`127.0.0.1:8089` — публикация ниже) остаётся,
+  # базы и трассировка берутся по именам служб, процесс слушает `0.0.0.0` внутри контейнера.
+  reminders:
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    #: Тот же образ продукта (см. комментарий у `bridge`): один Dockerfile — одно имя.
+    image: realty-agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # ❗ `F1`/OpenLIT: окно на штатное завершение. По умолчанию docker даёт 10 с и добивает SIGKILL,
+    # а выпуск новостей идёт 65–95 с, ход диалога ждёт до 240 с. SIGKILL обрывает `atexit`-досылку
+    # спанов (дерево в приёмнике обрезается — ЛОЖНЫЕ доказательства) и теряет запись о деньгах.
+    # 300 с дают процессу свернуться самому; переключатель гасит службы именно этим `stop`.
+    stop_grace_period: 300s
+    networks: [platform]
+    env_file:
+      #: Общая основа воркспейса — ПЕРВОЙ и необязательной: в ней лежат ключи, которые нужны
+      #: службе, но принадлежат не только ей (доступ к платформе, Telegram, LLM, подпись кнопок).
+      #: Нет файла — контейнер поднимется на своём `.env`: это законный одиночный клон.
+      - path: ../.env
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      #: Адреса баз и чекпойнтов берутся из `.env`: там КОНТЕЙНЕРНЫЕ имена (`reminders-db`, `pgvector`),
+      #: и один и тот же адрес верен внутри сети. Трассировка идёт на хост-шлюз: `host.docker.internal`
+      #: нашим контейнерам виден лишь при `extra_hosts` ниже.
+      OTEL_ENDPOINT: http://host.docker.internal:8680/api/otlp/v1/traces
+      # ❗ Второй вендор: адрес ЯВНО на хост-шлюз. В корневом `.env` он ХОСТОВЫЙ (127.0.0.1),
+      # а внутри контейнера 127.0.0.1 — сам контейнер: без этой строки спаны уходили бы «в себя»
+      # МОЛЧА. Порт 4318 опубликован на 0.0.0.0 именно поэтому (loopback из контейнера недостижим).
+      TELEMETRY_OTLP_ENDPOINT: http://host.docker.internal:4318/v1/traces
+    # Точка входа процесса графа: та же кодовая база, свой порт. `--host 0.0.0.0` обязателен: в
+    # изолированной сети loopback контейнера недостижим ни снаружи, ни по имени сервиса.
+    command: ["uvicorn", "realty_agent.reminders_main:app", "--host", "0.0.0.0", "--port", "8089", "--no-access-log"]
+    ports:
+      #: Только loopback: так адрес `http://127.0.0.1:8089` работает для хостовых проверок без правок. Внутри
+      #: сети служба доступна по имени (`reminders:8089`) — публикация для этого не нужна.
+      - "127.0.0.1:8089:8089"
+    extra_hosts:
+      #: Без этой строки трассировка пропала бы ТИХО: в контейнере `host.docker.internal` не резолвится, а
+      #: приём спанов живёт на хосте.
+      - "host.docker.internal:host-gateway"
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8089/health', timeout=5).status_code==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 40s
+
+  # Векторная база для RAG: корпус агентства и чанки объектов.
+  # Порт наружу не публикуется — доступ только изнутри сети, как у postgres стека.
+  pgvector:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: username
+      POSTGRES_PASSWORD: ${VECTOR_DB_PASSWORD:?VECTOR_DB_PASSWORD не задан}
+      POSTGRES_DB: vectors
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+    networks: [platform]
+    mem_limit: 512m
+    # Порт публикуется только на localhost и только ради ХОСТОВОГО пути запуска: мост в
+    # бою работает как хостовый процесс (systemd-юнит, `realty/bridge-up.sh run`), а не
+    # в этом compose, и внутрь docker-сети он не ходит. Наружу (не 127.0.0.1) не отдаётся.
+    # В контейнерном пути адрес — `pgvector:5432`, публикация там не нужна.
+    ports:
+      - "127.0.0.1:55433:5432"
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U username -d vectors"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+

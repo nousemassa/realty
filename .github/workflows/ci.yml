@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Композ разбирается
+        env:
+          PLATFORM_NETWORK: ci-network
+          VECTOR_DB_PASSWORD: ci-password
+          GRAPH_DB_PASSWORD: ci-password
+          LLAMA_EMBED_URL: http://embed:8082/v1
+          SOLVER_URL: http://solver:8083
+        run: >
+          docker compose --env-file .env.example -f compose.realty.yaml config -q
+      - name: Имя проекта compose не сменилось
+        env:
+          PLATFORM_NETWORK: ci-network
+          VECTOR_DB_PASSWORD: ci-password
+          GRAPH_DB_PASSWORD: ci-password
+          LLAMA_EMBED_URL: http://embed:8082/v1
+          SOLVER_URL: http://solver:8083
+        run: |
+          name="$(docker compose --env-file .env.example -f compose.realty.yaml config --format json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')"
+          test "$name" = "realty" || { echo "имя проекта изменилось: $name — тома останутся пустыми"; exit 1; }
+      - name: Лончеры синтаксически целы
+        run: |
+          bash -n realty-up.sh
+          bash -n bridge-up.sh
+          bash -n bridge-up-mcp.sh
+          bash -n bridge-up-reminders.sh
+          bash -n export.sh
+          for f in lib/*.sh; do bash -n "$f"; done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: python -m pip install --quiet --find-links wheels -e . pytest pytest-asyncio ruff
+      - name: Линтер
+        run: python -m ruff check .
+      - name: Офлайн-тесты
+        run: python -m pytest tests -q
